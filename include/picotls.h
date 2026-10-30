@@ -516,6 +516,17 @@ typedef struct st_ptls_aead_context_t {
      */
     size_t (*do_decrypt)(struct st_ptls_aead_context_t *ctx, void *output, const void *input, size_t inlen, uint64_t seq,
                          const void *aad, size_t aadlen);
+    /**
+     * Optional callback for in-place scatter-gather AEAD decryption over iovec slices.
+     * If successful, returns the amount of cleartext bytes decrypted in-place into input[0..input_count).
+     * Otherwise, cleanses any modified input slices and returns SIZE_MAX.
+     */
+    size_t (*do_decrypt_v)(struct st_ptls_aead_context_t *ctx, const ptls_iovec_t *input, size_t input_count, size_t inlen,
+                           uint64_t seq, const void *aad, size_t aadlen);
+    /**
+     * Optional callback to prefetch backend AEAD state into L1 cache (is_tx != 0 for TX, 0 for RX).
+     */
+    void (*do_prefetch)(struct st_ptls_aead_context_t *ctx, int is_tx);
 } ptls_aead_context_t;
 
 /**
@@ -1789,6 +1800,29 @@ int ptls_handshake(ptls_t *tls, ptls_buffer_t *sendbuf, const void *input, size_
  * decrypts the first record within given buffer
  */
 int ptls_receive(ptls_t *tls, ptls_buffer_t *plaintextbuf, const void *input, size_t *len);
+/**
+ * Maximum number of scatter-gather iovec slices accepted by `ptls_receive_iovec`.
+ */
+enum { PTLS_MAX_IOVECS = 64 };
+/**
+ * Decrypts TLS 1.3 post-handshake records in-place across scatter-gather iovecs without contiguous staging.
+ *
+ * When one complete TLS 1.3 record is present across `input[0..input_count)`:
+ * - `PTLS_CONTENT_TYPE_APPDATA` payloads are authenticated and decrypted in-place inside `input`; `plaintext[0..*plaintext_count)`
+ *   receives slices pointing directly into `input`, and `*wire_len` receives the total consumed record wire bytes.
+ * - Control records (`NewSessionTicket`, `KeyUpdate`, `Alert`) are decrypted into caller-provided `control_buf[0..control_cap)`
+ *   and processed before continuing to the next record or returning.
+ */
+int ptls_receive_iovec(ptls_t *tls, ptls_iovec_t *plaintext, size_t *plaintext_count, const ptls_iovec_t *input,
+                       size_t input_count, size_t *wire_len, uint8_t *control_buf, size_t control_cap);
+/**
+ * Prefetches the hot TLS 1.3 transmit state and AEAD cipher context into cache before `ptls_send`.
+ */
+void ptls_prefetch_tx(ptls_t *tls);
+/**
+ * Prefetches the hot TLS 1.3 receive state and AEAD cipher context into cache before `ptls_receive` / `ptls_receive_iovec`.
+ */
+void ptls_prefetch_rx(ptls_t *tls);
 /**
  * encrypts given buffer into multiple TLS records. During a TLS 1.3 handshake, this function can be used to send early data until
  * the client starts processing the server's handshake messages; after that, it returns PTLS_ERROR_IN_PROGRESS until application

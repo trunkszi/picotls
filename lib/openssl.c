@@ -1571,6 +1571,103 @@ static size_t aead_do_decrypt(ptls_aead_context_t *_ctx, void *_output, const vo
     return off;
 }
 
+static void aead_cleanse_iovec_prefix(const ptls_iovec_t *input, size_t input_count, size_t len)
+{
+    size_t remaining = len;
+    for (size_t i = 0; i < input_count && remaining != 0; ++i) {
+        if (input[i].len == 0)
+            continue;
+        size_t n = input[i].len < remaining ? input[i].len : remaining;
+        OPENSSL_cleanse(input[i].base, n);
+        remaining -= n;
+    }
+}
+
+static size_t aead_do_decrypt_v(ptls_aead_context_t *_ctx, const ptls_iovec_t *input, size_t input_count, size_t inlen,
+                                uint64_t seq, const void *aad, size_t aadlen)
+{
+    struct aead_crypto_context_t *ctx = (struct aead_crypto_context_t *)_ctx;
+    uint8_t iv[PTLS_MAX_IV_SIZE];
+    uint8_t tag[PTLS_MAX_DIGEST_SIZE];
+    size_t tag_size = ctx->super.algo->tag_size;
+    size_t body_len, body_remaining, tag_copied = 0, out_len = 0;
+    int blocklen, ret;
+
+    if (inlen < tag_size || tag_size > sizeof(tag) || inlen - tag_size > (size_t)INT_MAX)
+        return SIZE_MAX;
+
+    body_len = inlen - tag_size;
+    body_remaining = body_len;
+    ptls_aead__build_iv(ctx->super.algo, iv, ctx->static_iv, seq);
+    ret = EVP_DecryptInit_ex(ctx->evp_ctx, NULL, NULL, NULL, iv);
+    assert(ret);
+    if (aadlen != 0) {
+        ret = EVP_DecryptUpdate(ctx->evp_ctx, NULL, &blocklen, aad, (int)aadlen);
+        assert(ret);
+    }
+
+    for (size_t i = 0; i < input_count; ++i) {
+        const uint8_t *base = input[i].base;
+        size_t len = input[i].len;
+        if (len == 0)
+            continue;
+        if (body_remaining != 0) {
+            size_t slice_len = len < body_remaining ? len : body_remaining;
+            ret = EVP_DecryptUpdate(ctx->evp_ctx, (uint8_t *)base, &blocklen, base, (int)slice_len);
+            assert(ret);
+            out_len += (size_t)blocklen;
+            body_remaining -= slice_len;
+            base += slice_len;
+            len -= slice_len;
+        }
+        if (len != 0) {
+            size_t copy_len = len < (tag_size - tag_copied) ? len : (tag_size - tag_copied);
+            memcpy(tag + tag_copied, base, copy_len);
+            tag_copied += copy_len;
+        }
+    }
+
+    if (body_remaining != 0 || tag_copied != tag_size) {
+        aead_cleanse_iovec_prefix(input, input_count, body_len - body_remaining);
+        return SIZE_MAX;
+    }
+
+    if (!EVP_CIPHER_CTX_ctrl(ctx->evp_ctx, EVP_CTRL_GCM_SET_TAG, (int)tag_size, tag)) {
+        aead_cleanse_iovec_prefix(input, input_count, body_len);
+        return SIZE_MAX;
+    }
+
+    uint8_t final_block[16];
+    if (!EVP_DecryptFinal_ex(ctx->evp_ctx, final_block, &blocklen)) {
+        aead_cleanse_iovec_prefix(input, input_count, body_len);
+        return SIZE_MAX;
+    }
+    if (blocklen != 0) {
+        OPENSSL_cleanse(final_block, sizeof(final_block));
+        aead_cleanse_iovec_prefix(input, input_count, body_len);
+        return SIZE_MAX;
+    }
+
+    return out_len;
+}
+
+static void aead_do_prefetch(ptls_aead_context_t *_ctx, int is_tx)
+{
+    struct aead_crypto_context_t *ctx = (struct aead_crypto_context_t *)_ctx;
+    (void)is_tx;
+    if (ctx == NULL)
+        return;
+
+    __builtin_prefetch(ctx, 0, 3);
+    __builtin_prefetch(ctx->static_iv, 0, 3);
+    if (ctx->super.algo != NULL)
+        __builtin_prefetch(ctx->super.algo, 0, 3);
+    if (ctx->evp_ctx != NULL) {
+        __builtin_prefetch(ctx->evp_ctx, 1, 3);
+        __builtin_prefetch((const uint8_t *)ctx->evp_ctx + 64, 1, 3);
+    }
+}
+
 static int aead_setup_crypto(ptls_aead_context_t *_ctx, int is_enc, const void *key, const void *iv, const EVP_CIPHER *cipher)
 {
     struct aead_crypto_context_t *ctx = (struct aead_crypto_context_t *)_ctx;
@@ -1586,6 +1683,8 @@ static int aead_setup_crypto(ptls_aead_context_t *_ctx, int is_enc, const void *
         ctx->super.do_encrypt = ptls_aead__do_encrypt;
         ctx->super.do_encrypt_v = ptls_aead__do_encrypt_v;
         ctx->super.do_decrypt = NULL;
+        ctx->super.do_decrypt_v = NULL;
+        ctx->super.do_prefetch = aead_do_prefetch;
     } else {
         ctx->super.do_encrypt_init = NULL;
         ctx->super.do_encrypt_update = NULL;
@@ -1593,6 +1692,8 @@ static int aead_setup_crypto(ptls_aead_context_t *_ctx, int is_enc, const void *
         ctx->super.do_encrypt = NULL;
         ctx->super.do_encrypt_v = NULL;
         ctx->super.do_decrypt = aead_do_decrypt;
+        ctx->super.do_decrypt_v = aead_do_decrypt_v;
+        ctx->super.do_prefetch = aead_do_prefetch;
     }
     ctx->evp_ctx = NULL;
 

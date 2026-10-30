@@ -3,6 +3,78 @@ CMAKE_POLICY(SET CMP0003 NEW)
 
 PROJECT(picotls)
 
+IF (NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/deps/cifra/src/aes.c")
+    SET(PICOTLS_OPENSSL_PACKAGE_ONLY_DEFAULT ON)
+ELSE ()
+    SET(PICOTLS_OPENSSL_PACKAGE_ONLY_DEFAULT OFF)
+ENDIF ()
+OPTION(PICOTLS_OPENSSL_PACKAGE_ONLY
+    "Build and install unified picotls::picotls OpenSSL library and CMake package"
+    ${PICOTLS_OPENSSL_PACKAGE_ONLY_DEFAULT})
+
+IF (PICOTLS_OPENSSL_PACKAGE_ONLY)
+    INCLUDE(GNUInstallDirs)
+    INCLUDE(CMakePackageConfigHelpers)
+
+    FIND_PACKAGE(OpenSSL REQUIRED)
+
+    ADD_LIBRARY(picotls
+        "${CMAKE_CURRENT_SOURCE_DIR}/lib/picotls.c"
+        "${CMAKE_CURRENT_SOURCE_DIR}/lib/hpke.c"
+        "${CMAKE_CURRENT_SOURCE_DIR}/lib/pembase64.c"
+        "${CMAKE_CURRENT_SOURCE_DIR}/lib/openssl.c"
+    )
+    ADD_LIBRARY(picotls::picotls ALIAS picotls)
+    TARGET_COMPILE_FEATURES(picotls PUBLIC c_std_99)
+    TARGET_COMPILE_DEFINITIONS(picotls PRIVATE _GNU_SOURCE)
+    TARGET_INCLUDE_DIRECTORIES(picotls
+        PUBLIC
+            $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+            $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+    )
+    TARGET_LINK_LIBRARIES(picotls PUBLIC OpenSSL::Crypto ${CMAKE_DL_LIBS})
+
+    INSTALL(TARGETS picotls EXPORT picotlsTargets
+        ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
+        LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}"
+        RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
+    )
+    INSTALL(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/include/"
+        DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}"
+    )
+    INSTALL(EXPORT picotlsTargets
+        NAMESPACE picotls::
+        DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/picotls"
+    )
+
+    FILE(WRITE "${CMAKE_CURRENT_BINARY_DIR}/picotlsConfig.cmake.in"
+"@PACKAGE_INIT@\n\ninclude(CMakeFindDependencyMacro)\nfind_dependency(OpenSSL)\ninclude(\"\${CMAKE_CURRENT_LIST_DIR}/picotlsTargets.cmake\")\n"
+    )
+    CONFIGURE_PACKAGE_CONFIG_FILE(
+        "${CMAKE_CURRENT_BINARY_DIR}/picotlsConfig.cmake.in"
+        "${CMAKE_CURRENT_BINARY_DIR}/picotlsConfig.cmake"
+        INSTALL_DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/picotls"
+    )
+    WRITE_BASIC_PACKAGE_VERSION_FILE(
+        "${CMAKE_CURRENT_BINARY_DIR}/picotlsConfigVersion.cmake"
+        VERSION "2026.7.15"
+        COMPATIBILITY AnyNewerVersion
+    )
+    FILE(WRITE "${CMAKE_CURRENT_BINARY_DIR}/picotls.pc"
+"prefix=\${pcfiledir}/../..\nexec_prefix=\${prefix}\nlibdir=\${prefix}/${CMAKE_INSTALL_LIBDIR}\nincludedir=\${prefix}/${CMAKE_INSTALL_INCLUDEDIR}\n\nName: picotls\nDescription: Minimal picotls TLS 1.3 core with OpenSSL crypto\nVersion: 2026.07.15\nRequires.private: libcrypto\nLibs: -L\${libdir} -lpicotls\nCflags: -I\${includedir}\n"
+    )
+
+    INSTALL(FILES
+        "${CMAKE_CURRENT_BINARY_DIR}/picotlsConfig.cmake"
+        "${CMAKE_CURRENT_BINARY_DIR}/picotlsConfigVersion.cmake"
+        DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/picotls"
+    )
+    INSTALL(FILES "${CMAKE_CURRENT_BINARY_DIR}/picotls.pc"
+        DESTINATION "${CMAKE_INSTALL_LIBDIR}/pkgconfig"
+    )
+    RETURN()
+ENDIF ()
+
 IF (CMAKE_VERSION VERSION_LESS 3.13.0)
   MACRO (TARGET_LINK_DIRECTORIES target scope)
     link_directories(${ARGN})

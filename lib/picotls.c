@@ -7423,3 +7423,263 @@ Exit:
     return PTLS_ERROR_NOT_AVAILABLE;
 #endif
 }
+
+void ptls_prefetch_tx(ptls_t *tls)
+{
+    if (tls == NULL)
+        return;
+
+    __builtin_prefetch(&tls->state, 0, 3);
+    __builtin_prefetch(&tls->traffic_protection.enc, 1, 3);
+    if (tls->key_schedule != NULL)
+        __builtin_prefetch(tls->key_schedule, 0, 3);
+    if (tls->traffic_protection.enc.aead != NULL) {
+        if (tls->traffic_protection.enc.aead->do_prefetch != NULL) {
+            tls->traffic_protection.enc.aead->do_prefetch(tls->traffic_protection.enc.aead, 1);
+        } else {
+            __builtin_prefetch(tls->traffic_protection.enc.aead, 0, 3);
+        }
+    }
+}
+
+void ptls_prefetch_rx(ptls_t *tls)
+{
+    if (tls == NULL)
+        return;
+
+    __builtin_prefetch(&tls->state, 0, 3);
+    __builtin_prefetch(&tls->traffic_protection.dec, 1, 3);
+    if (tls->traffic_protection.dec.aead != NULL) {
+        if (tls->traffic_protection.dec.aead->do_prefetch != NULL) {
+            tls->traffic_protection.dec.aead->do_prefetch(tls->traffic_protection.dec.aead, 0);
+        } else {
+            __builtin_prefetch(tls->traffic_protection.dec.aead, 0, 3);
+        }
+    }
+}
+
+static int iovec_copy_range(uint8_t *dst, const ptls_iovec_t *iov, size_t iov_count, size_t offset, size_t length)
+{
+    size_t skipped = 0;
+    size_t copied = 0;
+
+    for (size_t i = 0; i < iov_count && copied < length; ++i) {
+        if (iov[i].len == 0)
+            continue;
+        if (skipped + iov[i].len <= offset) {
+            skipped += iov[i].len;
+            continue;
+        }
+        size_t slice_offset = offset > skipped ? offset - skipped : 0;
+        size_t avail = iov[i].len - slice_offset;
+        size_t take = avail < (length - copied) ? avail : (length - copied);
+        memcpy(dst + copied, iov[i].base + slice_offset, take);
+        copied += take;
+        skipped += iov[i].len;
+    }
+
+    return copied == length ? 0 : PTLS_ERROR_IN_PROGRESS;
+}
+
+static int iovec_slice_range(ptls_iovec_t *out, size_t *out_count, size_t out_cap, const ptls_iovec_t *iov, size_t iov_count,
+                             size_t offset, size_t length)
+{
+    size_t skipped = 0;
+    size_t remaining = length;
+    size_t count = 0;
+
+    for (size_t i = 0; i < iov_count && remaining != 0; ++i) {
+        if (iov[i].len == 0)
+            continue;
+        if (skipped + iov[i].len <= offset) {
+            skipped += iov[i].len;
+            continue;
+        }
+        size_t slice_offset = offset > skipped ? offset - skipped : 0;
+        size_t avail = iov[i].len - slice_offset;
+        size_t take = avail < remaining ? avail : remaining;
+        if (count == out_cap)
+            return PTLS_ERROR_NO_MEMORY;
+        out[count++] = ptls_iovec_init(iov[i].base + slice_offset, take);
+        remaining -= take;
+        skipped += iov[i].len;
+    }
+
+    if (remaining != 0)
+        return PTLS_ERROR_IN_PROGRESS;
+    *out_count = count;
+    return 0;
+}
+
+static int iovec_strip_inner_plaintext(ptls_iovec_t *iov, size_t *iov_count, uint8_t *record_type)
+{
+    size_t count = *iov_count;
+
+    while (count != 0) {
+        ptls_iovec_t *tail = &iov[count - 1];
+        while (tail->len != 0 && tail->base[tail->len - 1] == 0)
+            --tail->len;
+        if (tail->len != 0) {
+            *record_type = tail->base[--tail->len];
+            if (tail->len == 0)
+                --count;
+            *iov_count = count;
+            return 0;
+        }
+        --count;
+    }
+
+    return PTLS_ALERT_UNEXPECTED_MESSAGE;
+}
+
+static int iovec_handle_control_record(ptls_t *tls, uint8_t record_type, const ptls_iovec_t *fragments, size_t fragment_count,
+                                       uint8_t *control_buf, size_t control_cap)
+{
+    size_t total_len = 0;
+    for (size_t i = 0; i < fragment_count; ++i) {
+        if (fragments[i].len > SIZE_MAX - total_len)
+            return PTLS_ALERT_DECODE_ERROR;
+        total_len += fragments[i].len;
+    }
+
+    if (total_len == 0 && (record_type == PTLS_CONTENT_TYPE_ALERT || record_type == PTLS_CONTENT_TYPE_HANDSHAKE))
+        return PTLS_ALERT_UNEXPECTED_MESSAGE;
+
+    const uint8_t *contiguous = NULL;
+    if (fragment_count == 0) {
+        contiguous = control_buf;
+    } else if (fragment_count == 1) {
+        contiguous = fragments[0].base;
+    } else {
+        if (control_buf == NULL || total_len > control_cap)
+            return PTLS_ERROR_NO_MEMORY;
+        size_t off = 0;
+        for (size_t i = 0; i < fragment_count; ++i) {
+            memcpy(control_buf + off, fragments[i].base, fragments[i].len);
+            off += fragments[i].len;
+        }
+        contiguous = control_buf;
+    }
+
+    switch (record_type) {
+    case PTLS_CONTENT_TYPE_HANDSHAKE: {
+        struct st_ptls_record_t rec = {
+            .type = PTLS_CONTENT_TYPE_HANDSHAKE,
+            .version = 0x0303,
+            .length = total_len,
+            .fragment = contiguous,
+        };
+        return handle_handshake_record(
+            tls, tls->is_server ? handle_server_handshake_message : handle_client_handshake_message, NULL, &rec, NULL);
+    }
+    case PTLS_CONTENT_TYPE_ALERT:
+        return handle_alert(tls, contiguous, total_len);
+    default:
+        return PTLS_ALERT_UNEXPECTED_MESSAGE;
+    }
+}
+
+int ptls_receive_iovec(ptls_t *tls, ptls_iovec_t *plaintext, size_t *plaintext_count, const ptls_iovec_t *input,
+                       size_t input_count, size_t *wire_len, uint8_t *control_buf, size_t control_cap)
+{
+    ptls_iovec_t encrypted[PTLS_MAX_IOVECS];
+    size_t encrypted_count = PTLS_MAX_IOVECS;
+    size_t max_plaintext = 0;
+    size_t total_avail = 0;
+    size_t cursor = 0;
+    int ret = 0;
+
+    if (plaintext_count != NULL) {
+        max_plaintext = *plaintext_count;
+        *plaintext_count = 0;
+    }
+    if (wire_len != NULL)
+        *wire_len = 0;
+
+    if (tls == NULL || plaintext == NULL || plaintext_count == NULL || input == NULL || wire_len == NULL || input_count == 0 ||
+        input_count > PTLS_MAX_IOVECS || max_plaintext == 0)
+        return PTLS_ERROR_LIBRARY;
+
+    if (tls->state < PTLS_STATE_POST_HANDSHAKE_MIN || tls->traffic_protection.dec.tls12 ||
+        tls->traffic_protection.dec.aead == NULL || tls->recvbuf.rec.base != NULL || tls->recvbuf.mess.base != NULL)
+        return PTLS_ERROR_LIBRARY;
+
+    if (tls->traffic_protection.dec.aead->do_decrypt_v == NULL)
+        return PTLS_ERROR_NOT_AVAILABLE;
+
+    for (size_t i = 0; i < input_count; ++i) {
+        if (input[i].len != 0 && input[i].base == NULL)
+            return PTLS_ERROR_LIBRARY;
+        if (input[i].len > SIZE_MAX - total_avail)
+            return PTLS_ALERT_DECODE_ERROR;
+        total_avail += input[i].len;
+    }
+
+    while (cursor < total_avail) {
+        if (total_avail - cursor < 5)
+            return cursor == 0 ? PTLS_ERROR_IN_PROGRESS : 0;
+
+        uint8_t header[5];
+        if ((ret = iovec_copy_range(header, input, input_count, cursor, sizeof(header))) != 0)
+            return ret;
+
+        struct st_ptls_record_t rec = {0};
+        if ((ret = parse_record_header(&rec, header)) != 0)
+            return ret;
+
+        size_t record_wire_len = 5 + rec.length;
+        if (total_avail - cursor < record_wire_len)
+            return cursor == 0 ? PTLS_ERROR_IN_PROGRESS : 0;
+
+        if (rec.type != PTLS_CONTENT_TYPE_APPDATA)
+            return PTLS_ALERT_HANDSHAKE_FAILURE;
+
+        encrypted_count = PTLS_MAX_IOVECS;
+        if ((ret = iovec_slice_range(encrypted, &encrypted_count, max_plaintext < PTLS_MAX_IOVECS ? max_plaintext : PTLS_MAX_IOVECS,
+                                     input, input_count, cursor + 5, rec.length)) != 0)
+            return ret;
+
+        size_t decrypted_len = tls->traffic_protection.dec.aead->do_decrypt_v(
+            tls->traffic_protection.dec.aead, encrypted, encrypted_count, rec.length, tls->traffic_protection.dec.seq, header,
+            sizeof(header));
+        if (decrypted_len == SIZE_MAX)
+            return PTLS_ALERT_BAD_RECORD_MAC;
+        ++tls->traffic_protection.dec.seq;
+
+        size_t tag_size = tls->traffic_protection.dec.aead->algo->tag_size;
+        while (encrypted_count != 0 && tag_size != 0) {
+            ptls_iovec_t *tail = &encrypted[encrypted_count - 1];
+            size_t drop = tail->len < tag_size ? tail->len : tag_size;
+            tail->len -= drop;
+            tag_size -= drop;
+            if (tail->len == 0)
+                --encrypted_count;
+        }
+
+        uint8_t inner_type = 0;
+        if ((ret = iovec_strip_inner_plaintext(encrypted, &encrypted_count, &inner_type)) != 0)
+            return ret;
+
+        cursor += record_wire_len;
+        *wire_len = cursor;
+
+        if (inner_type == PTLS_CONTENT_TYPE_APPDATA) {
+            if (encrypted_count == 0)
+                continue;
+            for (size_t i = 0; i < encrypted_count; ++i)
+                plaintext[i] = encrypted[i];
+            *plaintext_count = encrypted_count;
+            return 0;
+        }
+
+        ret = iovec_handle_control_record(tls, inner_type, encrypted, encrypted_count, control_buf, control_cap);
+        if (ret == PTLS_ERROR_IN_PROGRESS) {
+            ret = 0;
+            continue;
+        }
+        if (ret != 0)
+            return ret;
+    }
+
+    return 0;
+}
